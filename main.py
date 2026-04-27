@@ -1,8 +1,16 @@
 import sys
 import os
+
+IS_WINDOWS = sys.platform == 'win32'
+if not IS_WINDOWS:
+    # Use native wayland if on Wayland to prevent XWayland's "Remote Desktop" screen sharing prompt
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        os.environ["QT_QPA_PLATFORM"] = "wayland"
+
 import json
 import subprocess
 import psutil
+import shutil
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, 
@@ -12,7 +20,15 @@ from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import Qt, QTimer
 from reference_dialog import ReferenceDialog
 
-RCLONE_EXE = "C:\\rclone\\rclone.exe"
+IS_WINDOWS = sys.platform == 'win32'
+
+def find_rclone():
+    rclone_path = shutil.which("rclone")
+    if rclone_path:
+        return rclone_path
+    return "C:\\rclone\\rclone.exe" if IS_WINDOWS else "rclone"
+
+RCLONE_EXE = find_rclone()
 
 def get_base_dir():
     if getattr(sys, 'frozen', False):
@@ -30,8 +46,12 @@ def get_resource_path(relative_path):
 SETTINGS_FILE = os.path.join(get_base_dir(), "settings.json")
 
 # Process Creation Flags for Windows
-CREATE_NO_WINDOW = 0x08000000
-DETACHED_PROCESS = 0x00000008
+if IS_WINDOWS:
+    CREATE_NO_WINDOW = 0x08000000
+    DETACHED_PROCESS = 0x00000008
+else:
+    CREATE_NO_WINDOW = 0
+    DETACHED_PROCESS = 0
 
 class ConfigManager:
     @staticmethod
@@ -53,36 +73,55 @@ class ConfigManager:
 class StartupManager:
     @staticmethod
     def get_startup_vbs_path():
-        startup_dir = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+        startup_dir = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
         return os.path.join(startup_dir, "RcloneAutoMount.vbs")
+
+    @staticmethod
+    def get_startup_desktop_path():
+        config_dir = os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+        autostart_dir = os.path.join(config_dir, "autostart")
+        os.makedirs(autostart_dir, exist_ok=True)
+        return os.path.join(autostart_dir, "RcloneAutoMount.desktop")
 
     @staticmethod
     def update_startup_script(mounts):
         # We only create the startup script if there are auto_start mounts.
-        # Instead of launching the python script (which might require conda), 
-        # we generate a VBScript that directly runs the compiled exe with --startup flag.
         app_path = os.path.abspath(sys.argv[0])
-        # If running from python source, app_path is main.py. We need to handle when packaged as exe.
-        is_exe = app_path.endswith('.exe')
+        is_exe = app_path.endswith('.exe') if IS_WINDOWS else not app_path.endswith('.py')
         
         has_auto = any(m.get("auto_start", False) for m in mounts)
-        vbs_path = StartupManager.get_startup_vbs_path()
         
-        if has_auto:
-            vbs_content = 'Set WshShell = CreateObject("WScript.Shell")\n'
-            if is_exe:
-                vbs_content += f'WshShell.Run """{app_path}"" --startup", 0, False\n'
+        if IS_WINDOWS:
+            vbs_path = StartupManager.get_startup_vbs_path()
+            if has_auto:
+                vbs_content = 'Set WshShell = CreateObject("WScript.Shell")\n'
+                if is_exe:
+                    vbs_content += f'WshShell.Run """{app_path}"" --startup", 0, False\n'
+                else:
+                    python_exe = sys.executable
+                    vbs_content += f'WshShell.Run """{python_exe}"" ""{app_path}"" --startup", 0, False\n'
+                with open(vbs_path, "w", encoding="utf-8") as f:
+                    f.write(vbs_content)
             else:
-                # Fallback for dev environment (assuming miniconda is in path or we just run python directly)
-                # In production, this won't be hit because it's packaged as exe.
-                python_exe = sys.executable
-                vbs_content += f'WshShell.Run """{python_exe}"" ""{app_path}"" --startup", 0, False\n'
-                
-            with open(vbs_path, "w", encoding="utf-8") as f:
-                f.write(vbs_content)
+                if os.path.exists(vbs_path):
+                    os.remove(vbs_path)
         else:
-            if os.path.exists(vbs_path):
-                os.remove(vbs_path)
+            desktop_path = StartupManager.get_startup_desktop_path()
+            if has_auto:
+                cmd = f'"{app_path}" --startup' if is_exe else f'"{sys.executable}" "{app_path}" --startup'
+                desktop_content = f"""[Desktop Entry]
+Type=Application
+Name=RcloneAutoMount
+Exec={cmd}
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+"""
+                with open(desktop_path, "w", encoding="utf-8") as f:
+                    f.write(desktop_content)
+            else:
+                if os.path.exists(desktop_path):
+                    os.remove(desktop_path)
 
 
 class MountManager:
@@ -92,7 +131,10 @@ class MountManager:
             return []
         try:
             # Hide console for this command too
-            result = subprocess.run([RCLONE_EXE, "config", "dump"], capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+            kwargs = {}
+            if IS_WINDOWS:
+                kwargs['creationflags'] = CREATE_NO_WINDOW
+            result = subprocess.run([RCLONE_EXE, "config", "dump"], capture_output=True, text=True, **kwargs)
             data = json.loads(result.stdout)
             return list(data.keys())
         except Exception as e:
@@ -105,36 +147,63 @@ class MountManager:
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
                 name = proc.info.get('name', '')
-                if name and name.lower() == 'rclone.exe':
+                if name and name.lower() in ('rclone.exe', 'rclone'):
                     cmdline = proc.info.get('cmdline', [])
                     if len(cmdline) >= 4 and cmdline[1] == 'mount':
                         remote = cmdline[2]
                         mountpoint = cmdline[3]
                         active[f"{remote}_{mountpoint}"] = proc.info['pid']
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except Exception as e:
                 pass
         return active
 
     @staticmethod
     def start_mount(mount_cfg):
         remote = mount_cfg["remote"]
-        mountpoint = mount_cfg["mountpoint"]
+        mountpoint = os.path.expanduser(mount_cfg["mountpoint"])
         flags = mount_cfg.get("flags", "")
         
+        if not IS_WINDOWS:
+            # Rclone on Linux requires the mount folder to exist
+            try:
+                os.makedirs(mountpoint, exist_ok=True)
+            except Exception as e:
+                print(f"Lỗi tạo thư mục mount: {e}")
+        
         cmd = [RCLONE_EXE, "mount", remote, mountpoint]
+        if not IS_WINDOWS:
+            cmd.append("--daemon")
+            
         if flags:
             # simple split, might not handle quotes perfectly but usually enough for standard rclone flags
-            cmd.extend(flags.split())
+            flag_list = flags.split()
+            if not IS_WINDOWS and "--network-mode" in flag_list:
+                flag_list.remove("--network-mode")
+            cmd.extend(flag_list)
             
-        subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS)
+        kwargs = {}
+        if IS_WINDOWS:
+            kwargs['creationflags'] = CREATE_NO_WINDOW | DETACHED_PROCESS
+        else:
+            kwargs['start_new_session'] = True
+            kwargs['stdout'] = subprocess.DEVNULL
+            kwargs['stderr'] = subprocess.DEVNULL
+            
+        subprocess.Popen(cmd, **kwargs)
 
     @staticmethod
-    def stop_mount(pid):
-        try:
-            p = psutil.Process(pid)
-            p.kill()
-        except:
-            pass
+    def stop_mount(pid, mountpoint=None):
+        if not IS_WINDOWS and mountpoint:
+            try:
+                os.system(f'fusermount3 -uz "{mountpoint}" || fusermount -uz "{mountpoint}"')
+            except:
+                pass
+        else:
+            try:
+                p = psutil.Process(pid)
+                p.kill()
+            except:
+                pass
 
 
 class AddMountDialog(QDialog):
@@ -153,9 +222,15 @@ class AddMountDialog(QDialog):
         self.combo_remote.addItems(remotes)
         layout.addWidget(self.combo_remote)
         
-        layout.addWidget(QLabel("Ô đĩa hoặc thư mục (VD: X: hoặc C:\\mnt):"))
-        self.edit_mountpoint = QLineEdit()
-        self.edit_mountpoint.setText("X:")
+        if IS_WINDOWS:
+            layout.addWidget(QLabel("Ô đĩa hoặc thư mục (VD: X: hoặc C:\\mnt):"))
+            self.edit_mountpoint = QLineEdit()
+            self.edit_mountpoint.setText("X:")
+        else:
+            layout.addWidget(QLabel("Thư mục (VD: /home/user/mnt/drive):"))
+            self.edit_mountpoint = QLineEdit()
+            mnt_path = os.path.join(os.path.expanduser("~"), "mnt", "drive")
+            self.edit_mountpoint.setText(mnt_path)
         layout.addWidget(self.edit_mountpoint)
         
         layout.addWidget(QLabel("Cờ mở rộng (Gợi ý Cân Bằng có sẵn):"))
@@ -319,7 +394,7 @@ class MainWindow(QMainWindow):
         if key in self.active_mounts:
             # Stop it
             pid = self.active_mounts[key]
-            MountManager.stop_mount(pid)
+            MountManager.stop_mount(pid, m['mountpoint'])
         else:
             # Start it
             if not os.path.exists(RCLONE_EXE):
@@ -351,11 +426,30 @@ class MainWindow(QMainWindow):
                 self.populate_table()
 
     def open_rclone_config(self):
-        if not os.path.exists(RCLONE_EXE):
-            QMessageBox.critical(self, "Lỗi", f"Không tìm thấy rclone tại: {RCLONE_EXE}")
+        if not os.path.exists(RCLONE_EXE) and not shutil.which("rclone"):
+            QMessageBox.critical(self, "Lỗi", f"Không tìm thấy rclone.")
             return
-        # Open in a new cmd window so user can interact
-        os.system(f'start cmd /c "{RCLONE_EXE} config"')
+            
+        if IS_WINDOWS:
+            os.system(f'start cmd /c "{RCLONE_EXE} config"')
+        else:
+            terminals = [
+                ('x-terminal-emulator', ['-e', RCLONE_EXE, 'config']),
+                ('gnome-terminal', ['--', RCLONE_EXE, 'config']),
+                ('konsole', ['-e', RCLONE_EXE, 'config']),
+                ('xfce4-terminal', ['-x', RCLONE_EXE, 'config']),
+                ('mate-terminal', ['--', RCLONE_EXE, 'config']),
+                ('lxterminal', ['-e', RCLONE_EXE, 'config']),
+                ('xterm', ['-e', RCLONE_EXE, 'config'])
+            ]
+            for term, args in terminals:
+                if shutil.which(term):
+                    try:
+                        subprocess.Popen([term] + args)
+                        return
+                    except Exception as e:
+                        print(f"Error launching {term}: {e}")
+            QMessageBox.critical(self, "Lỗi", "Không tìm thấy phần mềm Terminal nào để mở rclone config.")
         
     def open_reference(self):
         dlg = ReferenceDialog(self)
