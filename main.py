@@ -8,6 +8,7 @@ if not IS_WINDOWS:
         os.environ["QT_QPA_PLATFORM"] = "wayland"
 
 import json
+import shlex
 import subprocess
 import psutil
 import shutil
@@ -43,6 +44,12 @@ def get_settings_file():
         return os.path.join(config_dir, "settings.json")
     return os.path.join(get_base_dir(), "settings.json")
 
+def get_log_file():
+    return os.path.join(os.path.dirname(SETTINGS_FILE), "rclone_mount.log")
+
+def rclone_exists():
+    return os.path.exists(RCLONE_EXE) or shutil.which(RCLONE_EXE) is not None
+
 def get_resource_path(relative_path):
     if getattr(sys, 'frozen', False):
         base_path = sys._MEIPASS
@@ -52,6 +59,7 @@ def get_resource_path(relative_path):
 
 SETTINGS_FILE = get_settings_file()
 LEGACY_SETTINGS_FILE = os.path.join(get_base_dir(), "settings.json")
+LOG_FILE = get_log_file()
 
 # Process Creation Flags for Windows
 if IS_WINDOWS:
@@ -144,7 +152,7 @@ X-GNOME-Autostart-enabled=true
 class MountManager:
     @staticmethod
     def get_rclone_remotes():
-        if not os.path.exists(RCLONE_EXE):
+        if not rclone_exists():
             return []
         try:
             # Hide console for this command too
@@ -192,21 +200,57 @@ class MountManager:
             cmd.append("--daemon")
             
         if flags:
-            # simple split, might not handle quotes perfectly but usually enough for standard rclone flags
-            flag_list = flags.split()
+            try:
+                flag_list = shlex.split(flags, posix=not IS_WINDOWS)
+            except ValueError as e:
+                return False, f"Cờ mở rộng không hợp lệ: {e}", None
             if not IS_WINDOWS and "--network-mode" in flag_list:
                 flag_list.remove("--network-mode")
             cmd.extend(flag_list)
-            
+             
         kwargs = {}
+        log_handle = None
+        try:
+            os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+            log_handle = open(LOG_FILE, "a", encoding="utf-8")
+            log_handle.write("\n===== Rclone mount start =====\n")
+            log_handle.write("Command: " + subprocess.list2cmdline(cmd) + "\n")
+            log_handle.flush()
+        except Exception:
+            log_handle = None
+
         if IS_WINDOWS:
             kwargs['creationflags'] = CREATE_NO_WINDOW | DETACHED_PROCESS
+            if log_handle:
+                kwargs['stdout'] = log_handle
+                kwargs['stderr'] = log_handle
         else:
             kwargs['start_new_session'] = True
-            kwargs['stdout'] = subprocess.DEVNULL
-            kwargs['stderr'] = subprocess.DEVNULL
-            
-        subprocess.Popen(cmd, **kwargs)
+            kwargs['stdout'] = log_handle or subprocess.DEVNULL
+            kwargs['stderr'] = log_handle or subprocess.DEVNULL
+
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            exit_code = proc.wait(timeout=2)
+            error_tail = ""
+            if log_handle:
+                log_handle.flush()
+                log_handle.close()
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    error_tail = f.read()[-3000:]
+            except Exception:
+                pass
+            return False, f"Rclone thoát ngay với mã lỗi {exit_code}.\n\nLog: {LOG_FILE}\n\n{error_tail}", LOG_FILE
+        except subprocess.TimeoutExpired:
+            if log_handle:
+                log_handle.flush()
+                log_handle.close()
+            return True, None, LOG_FILE
+        except Exception as e:
+            if log_handle:
+                log_handle.close()
+            return False, str(e), LOG_FILE
 
     @staticmethod
     def stop_mount(pid, mountpoint=None):
@@ -437,10 +481,13 @@ class MainWindow(QMainWindow):
             MountManager.stop_mount(pid, m['mountpoint'])
         else:
             # Start it
-            if not os.path.exists(RCLONE_EXE):
+            if not rclone_exists():
                 QMessageBox.critical(self, "Lỗi", f"Không tìm thấy rclone tại: {RCLONE_EXE}")
                 return
-            MountManager.start_mount(m)
+            ok, error, log_file = MountManager.start_mount(m)
+            if not ok:
+                QMessageBox.critical(self, "Lỗi mount", error)
+                return
             
         self.refresh_active_status()
 
@@ -478,7 +525,7 @@ class MainWindow(QMainWindow):
                 self.populate_table()
 
     def open_rclone_config(self):
-        if not os.path.exists(RCLONE_EXE) and not shutil.which("rclone"):
+        if not rclone_exists():
             QMessageBox.critical(self, "Lỗi", f"Không tìm thấy rclone.")
             return
             
