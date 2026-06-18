@@ -36,6 +36,13 @@ def get_base_dir():
     else:
         return os.path.dirname(os.path.abspath(__file__))
 
+def get_settings_file():
+    if IS_WINDOWS:
+        config_root = os.environ.get("APPDATA") or os.path.expanduser("~")
+        config_dir = os.path.join(config_root, "RcloneAutoMount")
+        return os.path.join(config_dir, "settings.json")
+    return os.path.join(get_base_dir(), "settings.json")
+
 def get_resource_path(relative_path):
     if getattr(sys, 'frozen', False):
         base_path = sys._MEIPASS
@@ -43,7 +50,8 @@ def get_resource_path(relative_path):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
-SETTINGS_FILE = os.path.join(get_base_dir(), "settings.json")
+SETTINGS_FILE = get_settings_file()
+LEGACY_SETTINGS_FILE = os.path.join(get_base_dir(), "settings.json")
 
 # Process Creation Flags for Windows
 if IS_WINDOWS:
@@ -56,9 +64,13 @@ else:
 class ConfigManager:
     @staticmethod
     def load():
-        if os.path.exists(SETTINGS_FILE):
+        settings_file = SETTINGS_FILE
+        if not os.path.exists(settings_file) and os.path.exists(LEGACY_SETTINGS_FILE):
+            settings_file = LEGACY_SETTINGS_FILE
+
+        if os.path.exists(settings_file):
             try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                with open(settings_file, "r", encoding="utf-8") as f:
                     return json.load(f)
             except:
                 pass
@@ -66,8 +78,13 @@ class ConfigManager:
 
     @staticmethod
     def save(data):
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            return True, None
+        except Exception as e:
+            return False, str(e)
 
 
 class StartupManager:
@@ -214,12 +231,14 @@ class AddMountDialog(QDialog):
         self.resize(400, 200)
         self.remotes = remotes
         self.config = None
+        self.parent_window = parent
         
         layout = QVBoxLayout(self)
         
         layout.addWidget(QLabel("Chọn tài khoản Rclone (Remote):"))
         self.combo_remote = QComboBox()
         self.combo_remote.addItems(remotes)
+        self.combo_remote.currentTextChanged.connect(self.on_remote_changed)
         layout.addWidget(self.combo_remote)
         
         if IS_WINDOWS:
@@ -229,7 +248,9 @@ class AddMountDialog(QDialog):
         else:
             layout.addWidget(QLabel("Thư mục (VD: /home/user/mnt/drive):"))
             self.edit_mountpoint = QLineEdit()
-            mnt_path = os.path.join(os.path.expanduser("~"), "mnt", "drive")
+            # Gợi ý thư mục theo tên remote
+            remote_name = remotes[0] if remotes else "drive"
+            mnt_path = os.path.join(os.path.expanduser("~"), "mnt", remote_name)
             self.edit_mountpoint.setText(mnt_path)
         layout.addWidget(self.edit_mountpoint)
         
@@ -247,6 +268,12 @@ class AddMountDialog(QDialog):
         btn_layout.addWidget(btn_cancel)
         
         layout.addLayout(btn_layout)
+
+    def on_remote_changed(self, remote_name):
+        """Tự động cập nhật đường dẫn mount khi chọn remote khác"""
+        if not IS_WINDOWS:
+            mnt_path = os.path.join(os.path.expanduser("~"), "mnt", remote_name)
+            self.edit_mountpoint.setText(mnt_path)
         
     def save_and_close(self):
         remote = self.combo_remote.currentText()
@@ -259,6 +286,16 @@ class AddMountDialog(QDialog):
         if not mountpoint:
             QMessageBox.warning(self, "Lỗi", "Vui lòng nhập ổ đĩa/thư mục.")
             return
+        
+        # Kiểm tra trùng mountpoint với các mount đã có
+        if self.parent_window:
+            existing_mounts = self.parent_window.config_data.get("mounts", [])
+            for m in existing_mounts:
+                if os.path.expanduser(m["mountpoint"]) == os.path.expanduser(mountpoint):
+                    QMessageBox.warning(self, "Lỗi", 
+                        f"Thư mục '{mountpoint}' đã được sử dụng bởi remote '{m['remote']}'.\n"
+                        f"Vui lòng chọn thư mục khác.")
+                    return
             
         self.config = {
             "remote": remote,
@@ -383,7 +420,10 @@ class MainWindow(QMainWindow):
 
     def toggle_auto_start(self, idx, state):
         self.config_data["mounts"][idx]["auto_start"] = (state == Qt.Checked)
-        ConfigManager.save(self.config_data)
+        ok, error = ConfigManager.save(self.config_data)
+        if not ok:
+            QMessageBox.critical(self, "Lỗi", f"Không lưu được cấu hình:\n{error}")
+            return
         StartupManager.update_startup_script(self.config_data["mounts"])
 
     def toggle_mount(self, idx):
@@ -408,11 +448,18 @@ class MainWindow(QMainWindow):
         remotes = MountManager.get_rclone_remotes()
         # Clean remote names
         remotes = [r.replace(":", "") for r in remotes]
+        if not remotes:
+            QMessageBox.warning(self, "Lỗi", "Không tìm thấy remote rclone nào. Vui lòng cấu hình rclone trước.")
+            return
         
         dlg = AddMountDialog(remotes, self)
         if dlg.exec_() == QDialog.Accepted and dlg.config:
             self.config_data["mounts"].append(dlg.config)
-            ConfigManager.save(self.config_data)
+            ok, error = ConfigManager.save(self.config_data)
+            if not ok:
+                self.config_data["mounts"].pop()
+                QMessageBox.critical(self, "Lỗi", f"Không lưu được cấu hình:\n{error}")
+                return
             self.populate_table()
 
     def delete_mount_config(self):
@@ -421,7 +468,12 @@ class MainWindow(QMainWindow):
             reply = QMessageBox.question(self, "Xóa", "Bạn có chắc muốn xóa cấu hình này?", QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.Yes:
                 del self.config_data["mounts"][row]
-                ConfigManager.save(self.config_data)
+                ok, error = ConfigManager.save(self.config_data)
+                if not ok:
+                    QMessageBox.critical(self, "Lỗi", f"Không lưu được cấu hình:\n{error}")
+                    self.config_data = ConfigManager.load()
+                    self.populate_table()
+                    return
                 StartupManager.update_startup_script(self.config_data["mounts"])
                 self.populate_table()
 
